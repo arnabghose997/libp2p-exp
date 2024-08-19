@@ -3,133 +3,181 @@ package main
 import (
 	"context"
 	"fmt"
-	"time"
+	"os"
+	"path/filepath"
 
+	ipfsutil "berty.tech/weshnet/pkg/ipfsutil"
+	ipfs_mobile "berty.tech/weshnet/pkg/ipfsutil/mobile"
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
 	"fyne.io/fyne/v2/widget"
-	libp2p "github.com/libp2p/go-libp2p"
-	libp2pHost "github.com/libp2p/go-libp2p/core/host"
-	"github.com/libp2p/go-libp2p/p2p/protocol/ping"
-	ma "github.com/multiformats/go-multiaddr"
-    "github.com/libp2p/go-libp2p/core/peer"
+	ifacecore "github.com/ipfs/interface-go-ipfs-core"
+	"github.com/libp2p/go-libp2p"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/peerstore"
+	libp2p_host "github.com/libp2p/go-libp2p/core/host"
 )
 
+const swarmKeyFile = "swarm.key"
 
-var node libp2pHost.Host
-
-// Function to create a libp2p source node and return the host
-func createSourceNode() libp2pHost.Host {
-	host, err := libp2p.New(
+// someHostingFunc is a placeholder for libp2p host configuration
+func someHostingFunc(id peer.ID, ps peerstore.Peerstore, options ...libp2p.Option) (libp2p_host.Host, error) {
+	return libp2p.New(
 		libp2p.ListenAddrStrings(
-			"/ip4/0.0.0.0/tcp/8008", // Use any port you like
+			"/ip4/0.0.0.0/tcp/9000",         // regular tcp connections
+			"/ip4/0.0.0.0/udp/9000/quic-v1",        // regular tcp connections
 		),
+		libp2p.DefaultTransports,
+		libp2p.NATPortMap(),
 	)
-	if err != nil {
-		fmt.Println("Error creating node:", err)
-		return nil
-	}
-
-	return host
 }
 
-// Function to get the Node PeerID
-func getNodePeerID() string {
-	if node != nil {
-		return node.ID().String()
-	} else {
-		return "Error: Node is not running"
-	}
-}
+// createRepoPath checks if the repo path exists, and creates it if it doesn't
+func createRepoPath(repoPath string) error {
+	
 
-// Function to ping another node by its multiaddress
-func pingPeer(peerAddr string) string {
-	// Parse the peer multiaddress
-	addr, err := ma.NewMultiaddr(fmt.Sprintf("/ip4/192.168.0.217/tcp/9000/p2p/%s", peerAddr))
-	if err != nil {
-		return fmt.Sprintf("Invalid address: %s", err)
-	}
-
-	// Extract peer ID from the address
-	info, err := peer.AddrInfoFromP2pAddr(addr)
-	if err != nil {
-		return fmt.Sprintf("Failed to extract peer info: %s", err)
-	}
-
-	// Connect to the peer
-	if err := node.Connect(context.Background(), *info); err != nil {
-		return fmt.Sprintf("Failed to connect: %s", err)
-	}
-
-	// Send a ping
-	pingService := ping.NewPingService(node)
-	res := pingService.Ping(context.Background(), info.ID)
-
-	// Wait for the result
-	select {
-	case r := <-res:
-		if r.Error == nil {
-			return fmt.Sprintf("Ping successful! Latency: %s", r.RTT)
-		} else {
-			return fmt.Sprintf("Ping failed: %s", r.Error)
+	if _, err := os.Stat(repoPath); os.IsNotExist(err) {
+		fmt.Println("Repo path does not exist, creating...")
+		if err := os.MkdirAll(repoPath, 0755); err != nil {
+			return err
 		}
-	case <-time.After(time.Second * 10):
-		return "Ping timeout"
 	}
+	return nil
+}
+
+// generateSwarmKey generates or loads a swarm key
+func generateSwarmKey(repoPath string) (string, error) {
+	// Ensure the repo path exists
+	if err := createRepoPath(repoPath); err != nil {
+		return "", err
+	}
+
+	keyPath := filepath.Join(repoPath, swarmKeyFile)
+	if _, err := os.Stat(keyPath); err == nil {
+		fmt.Println("Swarm key exists, loading...")
+		data, err := os.ReadFile(keyPath)
+		if err != nil {
+			return "", err
+		}
+		return string(data), nil
+	}
+
+	fmt.Println("Swarm key not found, generating new one...")
+	newKey := "/key/swarm/psk/1.0.0/\n/base16/\n278b9a199c43fa84178920bd9f5cbcd69e933ddf02a8f69e47a3ea5a1705512f"
+	if err := os.WriteFile(keyPath, []byte(newKey), 0600); err != nil {
+		return "", err
+	}
+
+	return newKey, nil
+}
+
+// createNode creates and returns an IPFS CoreAPI instance
+func createNode(repoPath string) (ipfsutil.ExtendedCoreAPI, error) {
+	ipfsrepo, err := ipfsutil.LoadRepoFromPath(repoPath)
+	if err != nil {
+		return nil, err
+	}
+
+	mrepo := ipfs_mobile.NewRepoMobile(repoPath, ipfsrepo)
+	mnode, err := ipfsutil.NewIPFSMobile(context.TODO(), mrepo, &ipfsutil.MobileOptions{
+		HostOption: someHostingFunc,
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return ipfsutil.NewExtendedCoreAPIFromNode(mnode.IpfsNode)
+}
+
+// checkPeerAvailability simulates the `ipfs ping` command
+func checkPeerAvailability(api ifacecore.CoreAPI, peerID string) (string, error) {
+	pid, err := peer.Decode(peerID)
+	if err != nil {
+		return "", fmt.Errorf("failed to decode peer ID: %w", err)
+	}
+
+	peerInfo, err := api.Dht().FindPeer(context.Background(), pid)
+	if err != nil {
+		return "Ping failed: peer unreachable", nil
+	}
+
+	return fmt.Sprintf("Ping successful! Peer info: %v", peerInfo.ID), nil
 }
 
 func main() {
-	// Create a new application
 	myApp := app.New()
+	myWindow := myApp.NewWindow("IPFS Mobile Node")
 
-	// Create the libp2p host (node)
-	node = createSourceNode()
-	defer func() {
-		if node != nil {
-			node.Close()
+	// Swarm key label, initially hidden
+	swarmKeyLabel := widget.NewLabel("Swarm Key: ")
+	swarmKeyLabel.Hide()
+
+	peerIDEntry := widget.NewEntry()
+	peerIDEntry.SetPlaceHolder("Enter PeerID of counterparty IPFS node")
+
+	statusLabel := widget.NewLabel("Status: Waiting for action")
+
+	// Check Peer button, initially disabled
+	pingButton := widget.NewButton("Check Peer", nil)
+	pingButton.Disable()
+
+	var ipfsAPI ifacecore.CoreAPI
+
+	// Start button to initialize the IPFS node
+	baseStoragePath := fyne.CurrentApp().Storage().RootURI().Path()
+	repoPath := filepath.Join(baseStoragePath, ".ipfs")
+
+	startButton := widget.NewButton("Start", func() {
+		// Generate or load the swarm key
+		swarmKey, err := generateSwarmKey(repoPath)
+		if err != nil {
+			statusLabel.SetText(fmt.Sprintf("Failed to generate/load swarm key: %v", err))
+			return
 		}
-	}()
 
-	// Create a new window
-	myWindow := myApp.NewWindow("Simple App")
+		// Create IPFS node
+		ipfsAPI, err = createNode(repoPath)
+		if err != nil {
+			statusLabel.SetText(fmt.Sprintf("Failed to create IPFS node: %v", err))
+			return
+		}
 
-	// Set the desired window size (width x height)
-	myWindow.Resize(fyne.NewSize(400, 250))
-
-	// Create an entry widget for input
-	messageEntry := widget.NewEntry()
-	messageEntry.SetPlaceHolder("Enter PeerID and Address")
-
-	// Fetch the Node PeerID and create a label to display it
-	peerID := getNodePeerID()
-	peerIDLabel := widget.NewLabel(fmt.Sprintf("Node PeerID: %s", peerID))
-
-	// Create a label to show the ping result
-	resultLabel := widget.NewLabel("")
-
-	// Create a button
-	connectButton := widget.NewButton("Connect", func() {
-		// Capture the input value
-		peerAddr := messageEntry.Text
-
-		// Attempt to ping the entered PeerID
-		result := pingPeer(peerAddr)
-		resultLabel.SetText(result)
-		fmt.Println(result)
+		// Display swarm key and enable the Check Peer button
+		swarmKeyLabel.SetText("Swarm Key: " + swarmKey)
+		swarmKeyLabel.Show()
+		pingButton.Enable()
+		statusLabel.SetText("IPFS node started successfully")
 	})
 
-	// Create a container to hold the widgets
+	// Functionality for the Check Peer button
+	pingButton.OnTapped = func() {
+		peerID := peerIDEntry.Text
+		if peerID == "" {
+			statusLabel.SetText("Please enter a PeerID")
+			return
+		}
+
+		// Check peer availability
+		result, err := checkPeerAvailability(ipfsAPI, peerID)
+		if err != nil {
+			statusLabel.SetText(fmt.Sprintf("Check failed: %v", err))
+			return
+		}
+		statusLabel.SetText(result)
+	}
+
 	content := container.NewVBox(
-		messageEntry,
-		connectButton,
-		peerIDLabel,  // Add the label to display PeerID
-		resultLabel,  // Add the label to display the result
+		swarmKeyLabel,
+		peerIDEntry,
+		startButton,
+		pingButton,
+		statusLabel,
 	)
+	scroll := container.NewScroll(content)
 
-	// Set the content of the window
-	myWindow.SetContent(content)
+	myWindow.SetContent(scroll)
 
-	// Show and run the application
+	myWindow.Resize(fyne.NewSize(300, 400))
 	myWindow.ShowAndRun()
 }
